@@ -263,14 +263,22 @@ while true; do
             lock_to_ecores "$pid"
             is_throttled=1
             throttled_pid="$pid"
-            log_msg "⚠️ 触发保护 (PID=$pid): 合计CPU ${total_cpu}% (OneDrive ${od_cpu}% + 扩展 ${ext_cpu}% + fpd ${fpd_cpu}%) 但网速仅 ${net_kbps}KB/s -> 已重置 $closed_cnt 个连接、锁入能效核并注入脉冲退避"
-            notify_user "⚠️ OneDrive 疑似卡死空转" "已锁入小核 + 注入退避刹车 (合计CPU ${total_cpu}%)" "已重置 ${closed_cnt} 条连接并压制徽章死锁，待文件就绪或恢复传输后自动还原大核。"
-            # 立即执行一次脉冲退避（暂停3秒+放行2秒 x 2轮），打破 UploadGate 与 fileproviderd 的 0ms 抢锁死循环
-            apply_backoff_pulse "$pid" 3 2 2
+            fp_storm=$(awk -v f="${fpd_cpu:-0}" -v e="${ext_cpu:-0}" 'BEGIN { print ((f + e) >= 15.0) ? 1 : 0 }')
+            if [[ $fp_storm -eq 1 ]]; then
+                log_msg "⚠️ 触发保护 (PID=$pid): 合计CPU ${total_cpu}% (OneDrive ${od_cpu}% + 扩展 ${ext_cpu}% + fpd ${fpd_cpu}%) 网速 ${net_kbps}KB/s -> 已重置 $closed_cnt 个连接、锁入小核并注入脉冲退避破除徽章死锁"
+                notify_user "⚠️ OneDrive 疑似卡死空转" "已锁入小核 + 注入退避刹车 (合计CPU ${total_cpu}%)" "已重置 ${closed_cnt} 条连接并打断 FileProvider 徽章死锁，恢复传输后自动还原大核。"
+                apply_backoff_pulse "$pid" 3 2 2
+            else
+                log_msg "⚠️ 触发保护 (PID=$pid): 合计CPU ${total_cpu}% (OneDrive ${od_cpu}% 全量目录扫描中) 网速 ${net_kbps}KB/s -> 已重置 $closed_cnt 个连接并锁入能效核静音运行"
+                notify_user "⚠️ OneDrive 正在高负载扫描目录" "已锁入能效核静音运行 (CPU ${total_cpu}%)" "已重置 ${closed_cnt} 条连接并限制在小核后台扫描，待扫描完毕开始传输后自动还原大核。"
+            fi
         elif [[ $is_throttled -eq 1 ]]; then
-            # 仍在死循环中：持续补锁新派生的扩展进程，并施加温和脉冲退避压制 CPU 与风扇发热
+            # 仍在高负载空转中：持续补锁新派生的扩展进程；仅当存在 FileProvider 徽章风暴时才注入 SIGSTOP 脉冲
             lock_to_ecores "$pid"
-            apply_backoff_pulse "$pid" 3 2 2
+            fp_storm=$(awk -v f="${fpd_cpu:-0}" -v e="${ext_cpu:-0}" 'BEGIN { print ((f + e) >= 15.0) ? 1 : 0 }')
+            if [[ $fp_storm -eq 1 ]]; then
+                apply_backoff_pulse "$pid" 3 2 2
+            fi
         fi
     else
         if [[ $is_throttled -eq 1 ]]; then
