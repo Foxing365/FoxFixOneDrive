@@ -1,29 +1,33 @@
 #!/bin/zsh
 # ==============================================================================
-# OneDrive 防失控守护脚本 v6 (累计 CPU 积分 + 扩展进程纳管 + 脉冲退避破除本地死锁)
+# OneDrive 防失控守护脚本 v7 (多账号感知 + 脉冲占空比压制 + 内存死锁自愈热重启)
 # 作用：
-# 1. 采用【累计 CPU 时间差 (cputime delta)】计算采样周期内的真实平均 CPU（含 OneDrive、
-#    OneDrive File Provider 扩展进程、以及系统 fileproviderd 守护进程）。
-# 2. 当处于「高 CPU + 0 网速」死循环（无论是代理节点断流，还是本地批量生成文件引发的
-#    UploadGate::RequeueOrRemoveUpload <-> fileproviderd 徽章刷新自激死锁）：
-#    - 重置 Clash 卡死连接；
-#    - 将 OneDrive 与 OneDrive File Provider 双双锁入能效核 (taskpolicy -b)；
-#    - 注入微软漏写的【指数/脉冲退避刹车 (SIGSTOP/SIGCONT)】：每次暂停 OneDrive 3 秒让
-#      fileproviderd 排空 XPC 队列、打破 hasFileChangedInternal 自激竞争，同时把活动监视器
-#      里的 CPU 占用立竿见影压下来。
-# 3. 一旦网速恢复 (>= 50 KB/s) 或总 CPU 彻底平息 (< 15%)，立即恢复全速大核运行。
+# 1. 多实例精准定位：自动识别 Personal 与多个 Business 账号实例中真正高负载的 PID，
+#    避免被低 PID 的空闲实例误导。
+# 2. 累计 CPU 时间差 (cputime delta) 积分测量：精准统计周期内 OneDrive、
+#    OneDrive File Provider 扩展进程、以及系统 fileproviderd 的真实平均 CPU。
+# 3. 三级防御体系（针对代理断流、getFolderByRelativePathFromCache O(F) 扫描风暴、
+#    以及 UploadGate::NotifyUploadRemoved 0.8秒内存死锁）：
+#    - 第一级：精准切断 Clash 中卡死的 OneDrive 僵尸连接；
+#    - 第二级：锁入能效核 (taskpolicy -b) + 注入占空比脉冲退避刹车 (暂停4秒/放行2秒)，
+#      既允许扫描推进、打破本地写文件竞争，又将活动监视器 CPU 压制在 20% 左右；
+#    - 第三级：若连续多个周期 0 KB/s 空转无法自拔（内存 UploadGate 队列死锁），自动对
+#      卡死实例执行无感热重启 (SIGTERM + open -g -n -a OneDrive)，彻底清空脏状态并恢复上传。
+# 4. 一旦网速恢复 (>= 50 KB/s) 或总 CPU 彻底平息 (< 15%)，立即解除刹车恢复大核全速同步。
 # ==============================================================================
 
 export PATH="/usr/bin:/bin:/usr/sbin:/sbin:/usr/local/bin:/opt/homebrew/bin"
 
 IDLE_CHECK_INTERVAL=35       # 正常态采样周期（秒）：每35秒算一次平均CPU，自身0消耗
-ACTIVE_CHECK_INTERVAL=12     # 疑似/降频态采样周期（秒）
+ACTIVE_CHECK_INTERVAL=10     # 疑似/降频态采样周期（秒）
 AVG_CPU_THRESHOLD=25.0       # 周期内 OneDrive 本体平均 CPU 阈值 (%)
 TOTAL_CPU_THRESHOLD=45.0     # OneDrive + FileProvider扩展 + fileproviderd 合计平均 CPU 阈值 (%)
 NET_SPEED_THRESHOLD_KB=10.0  # 死循环判定网速上限 (KB/s)：低于此值视为无实质传输
 FAST_RECOVERY_NET_KB=50.0    # 高速同步恢复阈值 (KB/s)：高于此值立即解除限速全速上传
 STRIKE_LIMIT=2               # 连续 2 个积分周期确认空转即触发保护
-RECOVERY_CPU_THRESHOLD=15.0  # 恢复大核的合计平均 CPU 阈值 (%)
+RECOVERY_CPU_THRESHOLD=14.0  # 恢复大核的合计平均 CPU 阈值 (%)
+AUTO_RESTART_CYCLES=8        # 持续空转多少个降频周期后触发无感热重启清理内存死锁
+RESTART_COOLDOWN_SECS=900    # 两次自动热重启之间的最小冷却时间（秒，默认15分钟）
 
 LOG_FILE="$HOME/.cache/onedrive-guard/guard.log"
 CLASH_SOCK="/var/run/clash-verge-service/users/$(id -u)/verge-mihomo.sock"
@@ -46,8 +50,13 @@ notify_user() {
     osascript -e "display notification \"$message\" with title \"$title\" subtitle \"$subtitle\"" >/dev/null 2>&1 &
 }
 
+# 多账号支持：返回当前 CPU 占用最高的 OneDrive 主进程 PID
 get_onedrive_pid() {
-    pgrep -f "/Applications/OneDrive.app/Contents/MacOS/OneDrive$" | head -n 1
+    ps -axo pid=,pcpu=,comm= | awk '/\/Applications\/OneDrive\.app\/Contents\/MacOS\/OneDrive$/ { print $1, $2 }' | sort -k2 -nr | awk 'NR==1 {print $1}'
+}
+
+get_all_onedrive_pids() {
+    pgrep -f "/Applications/OneDrive.app/Contents/MacOS/OneDrive$"
 }
 
 get_fp_ext_pids() {
@@ -169,7 +178,7 @@ except Exception:
 
 lock_to_ecores() {
     local pid=$1
-    /usr/sbin/taskpolicy -b -p "$pid" >/dev/null 2>&1
+    [[ -n "$pid" ]] && /usr/sbin/taskpolicy -b -p "$pid" >/dev/null 2>&1
     local p
     for p in $(get_fp_ext_pids); do
         /usr/sbin/taskpolicy -b -p "$p" >/dev/null 2>&1
@@ -177,21 +186,21 @@ lock_to_ecores() {
 }
 
 restore_onedrive_priority() {
-    local pid=$1
-    [[ -n "$pid" ]] && {
-        kill -CONT "$pid" >/dev/null 2>&1
-        /usr/sbin/taskpolicy -B -p "$pid" >/dev/null 2>&1
-    }
     local p
+    for p in $(get_all_onedrive_pids); do
+        kill -CONT "$p" >/dev/null 2>&1
+        /usr/sbin/taskpolicy -B -p "$p" >/dev/null 2>&1
+    done
     for p in $(get_fp_ext_pids); do
+        kill -CONT "$p" >/dev/null 2>&1
         /usr/sbin/taskpolicy -B -p "$p" >/dev/null 2>&1
     done
 }
 
-# 注入脉冲退避：暂停 OneDrive 几秒钟，让 fileproviderd 排空徽章队列、打破 hasFileChangedInternal 自激死锁
+# 注入占空比脉冲退避：暂停 OneDrive 4秒、放行 2秒，把活动监视器 CPU 压到 ~20% 同时允许扫描推进
 apply_backoff_pulse() {
     local pid=$1
-    local pause_secs=${2:-3}
+    local pause_secs=${2:-4}
     local run_secs=${3:-2}
     local cycles=${4:-2}
     local i
@@ -204,19 +213,34 @@ apply_backoff_pulse() {
     done
 }
 
+# 无感热重启卡死的 OneDrive 实例，清空内存 UploadGate 中因 mtime/size 不一致而死锁的脏队列
+restart_stuck_onedrive() {
+    local pid=$1
+    [[ -z "$pid" ]] && return
+    kill -CONT "$pid" >/dev/null 2>&1
+    kill -TERM "$pid" >/dev/null 2>&1
+    sleep 3
+    if kill -0 "$pid" 2>/dev/null; then
+        kill -9 "$pid" >/dev/null 2>&1
+        sleep 1
+    fi
+    open -g -n -a OneDrive >/dev/null 2>&1
+}
+
 # 退出时兜底恢复，绝不留下被 SIGSTOP 挂起的进程
 cleanup_on_exit() {
-    local pid=$(get_onedrive_pid)
-    restore_onedrive_priority "$pid"
+    restore_onedrive_priority
     exit 0
 }
 trap cleanup_on_exit EXIT INT TERM
 
-log_msg "OneDrive 防失控守护进程 v6 (含 FileProvider 扩展纳管与脉冲退避破死锁) 已启动。"
+log_msg "OneDrive 防失控守护进程 v7 (多账号精准定位 + 占空比脉冲降频 + 内存死锁自愈热重启) 已启动。"
 
 strike_count=0
 is_throttled=0
 throttled_pid=""
+throttled_cycles=0
+last_restart_ts=0
 
 while true; do
     pid=$(get_onedrive_pid)
@@ -225,14 +249,15 @@ while true; do
         strike_count=0
         is_throttled=0
         throttled_pid=""
+        throttled_cycles=0
         sleep "$IDLE_CHECK_INTERVAL"
         continue
     fi
 
-    if [[ $is_throttled -eq 1 && "$pid" != "$throttled_pid" ]]; then
-        is_throttled=0
-        strike_count=0
-        throttled_pid=""
+    if [[ $is_throttled -eq 1 && -n "$throttled_pid" && "$pid" != "$throttled_pid" ]]; then
+        # 若焦点切换到了新进程，先确保旧进程不会遗留 STOP 状态
+        kill -CONT "$throttled_pid" >/dev/null 2>&1
+        throttled_pid="$pid"
     fi
 
     window=$IDLE_CHECK_INTERVAL
@@ -255,7 +280,7 @@ while true; do
     if [[ $is_spinning -eq 1 ]]; then
         ((strike_count++))
         if [[ $is_throttled -eq 0 ]]; then
-            log_msg "检测到死循环空转 ($strike_count/$STRIKE_LIMIT): OneDrive=${od_cpu}%, 扩展=${ext_cpu}%, fileproviderd=${fpd_cpu}% (合计=${total_cpu}%), 网速=${net_kbps}KB/s"
+            log_msg "检测到死循环空转 ($strike_count/$STRIKE_LIMIT) [PID=$pid]: OneDrive=${od_cpu}%, 扩展=${ext_cpu}%, fileproviderd=${fpd_cpu}% (合计=${total_cpu}%), 网速=${net_kbps}KB/s"
         fi
 
         if [[ $strike_count -ge $STRIKE_LIMIT && $is_throttled -eq 0 ]]; then
@@ -263,41 +288,48 @@ while true; do
             lock_to_ecores "$pid"
             is_throttled=1
             throttled_pid="$pid"
-            fp_storm=$(awk -v f="${fpd_cpu:-0}" -v e="${ext_cpu:-0}" 'BEGIN { print ((f + e) >= 15.0) ? 1 : 0 }')
-            if [[ $fp_storm -eq 1 ]]; then
-                log_msg "⚠️ 触发保护 (PID=$pid): 合计CPU ${total_cpu}% (OneDrive ${od_cpu}% + 扩展 ${ext_cpu}% + fpd ${fpd_cpu}%) 网速 ${net_kbps}KB/s -> 已重置 $closed_cnt 个连接、锁入小核并注入脉冲退避破除徽章死锁"
-                notify_user "⚠️ OneDrive 疑似卡死空转" "已锁入小核 + 注入退避刹车 (合计CPU ${total_cpu}%)" "已重置 ${closed_cnt} 条连接并打断 FileProvider 徽章死锁，恢复传输后自动还原大核。"
-                apply_backoff_pulse "$pid" 3 2 2
-            else
-                log_msg "⚠️ 触发保护 (PID=$pid): 合计CPU ${total_cpu}% (OneDrive ${od_cpu}% 全量目录扫描中) 网速 ${net_kbps}KB/s -> 已重置 $closed_cnt 个连接并锁入能效核静音运行"
-                notify_user "⚠️ OneDrive 正在高负载扫描目录" "已锁入能效核静音运行 (CPU ${total_cpu}%)" "已重置 ${closed_cnt} 条连接并限制在小核后台扫描，待扫描完毕开始传输后自动还原大核。"
-            fi
+            throttled_cycles=1
+            log_msg "⚠️ 触发保护 (PID=$pid): 合计CPU ${total_cpu}% (OneDrive ${od_cpu}% + 扩展 ${ext_cpu}% + fpd ${fpd_cpu}%) 网速 ${net_kbps}KB/s -> 已重置 $closed_cnt 个连接、锁入小核并启动脉冲退避限流"
+            notify_user "⚠️ OneDrive 高负载空转已被压制" "已锁入小核 + 脉冲降频 (合计CPU ${total_cpu}%)" "已重置 ${closed_cnt} 条连接并注入退避刹车将 CPU 压至低位，恢复传输后自动还原大核。"
+            apply_backoff_pulse "$pid" 4 2 2
         elif [[ $is_throttled -eq 1 ]]; then
-            # 仍在高负载空转中：持续补锁新派生的扩展进程；仅当存在 FileProvider 徽章风暴时才注入 SIGSTOP 脉冲
+            ((throttled_cycles++))
             lock_to_ecores "$pid"
-            fp_storm=$(awk -v f="${fpd_cpu:-0}" -v e="${ext_cpu:-0}" 'BEGIN { print ((f + e) >= 15.0) ? 1 : 0 }')
-            if [[ $fp_storm -eq 1 ]]; then
-                apply_backoff_pulse "$pid" 3 2 2
+            now_ts=$(date +%s)
+            if [[ $throttled_cycles -ge $AUTO_RESTART_CYCLES && $((now_ts - last_restart_ts)) -ge $RESTART_COOLDOWN_SECS ]]; then
+                log_msg "🔄 触发自愈热重启 (PID=$pid): 已连续空转 $throttled_cycles 个周期仍为 0 KB/s，判定内存 UploadGate 队列死锁，正在执行后台无感重启..."
+                notify_user "🔄 OneDrive 内存死锁自动修复中" "正在后台热重启卡死实例 (PID $pid)" "已自动清理卡死的 UploadGate 内存队列并重新拉起同步，无需手动暂停。"
+                restart_stuck_onedrive "$pid"
+                last_restart_ts=$now_ts
+                is_throttled=0
+                strike_count=0
+                throttled_pid=""
+                throttled_cycles=0
+                sleep 15
+            else
+                apply_backoff_pulse "$pid" 4 2 2
             fi
         fi
     else
         if [[ $is_throttled -eq 1 ]]; then
             if (( $(echo "$net_kbps >= $FAST_RECOVERY_NET_KB" | bc -l) )); then
-                restore_onedrive_priority "$pid"
+                restore_onedrive_priority
                 is_throttled=0
                 strike_count=0
                 throttled_pid=""
+                throttled_cycles=0
                 log_msg "✅ 解除保护 (PID=$pid): 实时同步正在高速传输 (网速 ${net_kbps} KB/s)，已立即恢复大核全速运行"
                 notify_user "✅ OneDrive 同步已恢复高速传输" "当前实时网速 ${net_kbps} KB/s" "死锁已解除，已自动恢复大核 (P-Core) 全速同步。"
             elif (( $(echo "$total_cpu < $RECOVERY_CPU_THRESHOLD" | bc -l) )); then
-                restore_onedrive_priority "$pid"
+                restore_onedrive_priority
                 is_throttled=0
                 strike_count=0
                 throttled_pid=""
+                throttled_cycles=0
                 log_msg "✅ 解除保护 (PID=$pid): 合计CPU 已稳定回落至 ${total_cpu}% (OneDrive ${od_cpu}%) -> 已恢复大核(P-Core)默认调度"
-                notify_user "✅ OneDrive 已恢复正常" "合计CPU 已回落至 ${total_cpu}%" "空转已结束，已为您自动恢复大核 (P-Core) 默认调度。"
+                notify_user "✅ OneDrive 已恢复安静" "合计CPU 已回落至 ${total_cpu}%" "空转已结束，已为您自动恢复大核 (P-Core) 默认调度。"
             else
-                # 网速在 10~50 KB/s 之间但 CPU 仍高：保持小核观察，暂不盲目解封大核
+                # 仍在过渡态：保持小核观察
                 lock_to_ecores "$pid"
             fi
         else
