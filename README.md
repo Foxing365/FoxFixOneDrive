@@ -49,9 +49,13 @@ flowchart TD
 3. **100% 双向可逆的 Apple Silicon 大小核调度（仅用 `taskpolicy -b / -B`）**
    - 死循环期间调用 `/usr/sbin/taskpolicy -b -p <PID>` 将 OneDrive 限制到 Apple Silicon **能效小核（E-Core）**，功耗立降 80% 以上；
    - 一旦检测到真实网速恢复（`>= 5 KB/s`）或 CPU 回落稳定，第 1 时间调用 `/usr/sbin/taskpolicy -B -p <PID>` **100% 无损放回性能大核（P-Core）**（不使用在非 root 下不可逆的 `renice`）。
-4. **100% 穿透「勿扰模式」的原生右上角毛玻璃悬浮通知**
+4. **100% 穿透「勿扰模式」的原生静音右上角毛玻璃悬浮通知**
    - 内置约 120 行 Swift 编写的原生 AppKit 悬浮横幅组件 [`src/onedrive_hud.swift`](src/onedrive_hud.swift)：
-   - 采用 `.nonactivatingPanel` + `.statusBar` 层级，**直接穿透 macOS 勿扰模式/专注模式**，**绝不抢占打字焦点**，显示 6.5 秒后自动淡出退出（**0 内存后台驻留**），同时写入系统通知中心留存历史。
+   - 采用 `.nonactivatingPanel` + `.statusBar` 层级，**直接穿透 macOS 勿扰模式/专注模式**，**全程静音无提示音干扰**、**绝不抢占打字焦点**，显示 6.5 秒后自动淡出退出（**0 内存后台驻留**），同时写入系统通知中心留存历史。
+5. **多账号感知 + 脉冲占空比压制 + `UploadGate` 内存死锁无感自愈热重启（v7 新增）**
+   - **多实例精准定位**：自动在个人版（`Personal`）与多个企业/教育版（`Business`）实例中按实时 CPU 锁定高负载进程。
+   - **占空比脉冲刹车**：空转期间执行「暂停 4 秒 / 放行 2 秒」脉冲限流，既允许扫描与上传推进，又将活动监视器平均 CPU 压制在 20% 以下。
+   - **内存死锁自愈**：当文件在上传排队中途被外部频繁改写引发 `EnclosureUploader::DoesFileAdditionNeedToBeUploaded` → `UploadGate::NotifyUploadRemoved` 内存队列死锁（连续 8 个周期 `0 KB/s` 空转）时，自动执行后台无感热重启（`SIGTERM` + `open -g -n -a OneDrive`），清空脏队列并立即恢复上传。
 
 ---
 

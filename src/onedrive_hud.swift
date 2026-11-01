@@ -88,8 +88,6 @@ final class HUDAppDelegate: NSObject, NSApplicationDelegate {
         panel.contentView = visualEffect
         panel.orderFrontRegardless()
 
-        NSSound(named: NSSound.Name("Glass"))?.play()
-
         NSAnimationContext.runAnimationGroup { ctx in
             ctx.duration = 0.22
             self.panel.animator().alphaValue = 0.98
