@@ -1,0 +1,6 @@
+.DS_Store
+bin/
+*.o
+*.dSYM/
+*.log
+*.pid
