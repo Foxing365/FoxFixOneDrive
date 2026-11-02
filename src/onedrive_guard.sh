@@ -232,6 +232,34 @@ cleanup_on_exit() {
     restore_onedrive_priority
     exit 0
 }
+
+# 支持命令行子命令：--test-notify / --restore / --once / --daemon
+case "${1:---daemon}" in
+    --test-notify)
+        notify_user "☁️ FoxFixOneDrive 已就绪" "穿透勿扰模式静音悬浮通知测试成功" "当 OneDrive 出现 0 KB/s 高负载死循环时，将自动重置连接、降频并在此静默提醒。"
+        echo "✅ 已发送右上角静音悬浮通知测试。"
+        exit 0
+        ;;
+    --restore)
+        restore_onedrive_priority
+        log_msg "🔧 手动触发 --restore：已将所有 OneDrive 实例与扩展恢复至大核 (P-Core) 默认调度。"
+        echo "✅ 已将所有 OneDrive 实例与 FileProvider 扩展恢复至大核默认调度。"
+        exit 0
+        ;;
+    --once)
+        pid=$(get_onedrive_pid)
+        if [[ -z "$pid" ]]; then
+            echo "ℹ️ 当前未检测到运行中的 OneDrive 进程。"
+            exit 0
+        fi
+        echo "⏳ 正在对 OneDrive (PID=$pid) 进行 3 秒实时采样..."
+        read -r od_cpu fpd_cpu ext_cpu net_kbps <<< "$(measure_window "$pid" 3)"
+        total_cpu=$(awk -v a="${od_cpu:-0}" -v b="${fpd_cpu:-0}" -v c="${ext_cpu:-0}" 'BEGIN { printf "%.1f", a + b + c }')
+        echo "📊 采样结果 [PID=$pid]: OneDrive=${od_cpu}% | 扩展=${ext_cpu}% | fileproviderd=${fpd_cpu}% | 合计CPU=${total_cpu}% | 实时网速=${net_kbps} KB/s"
+        exit 0
+        ;;
+esac
+
 trap cleanup_on_exit EXIT INT TERM
 
 log_msg "OneDrive 防失控守护进程 v7 (多账号精准定位 + 占空比脉冲降频 + 内存死锁自愈热重启) 已启动。"
